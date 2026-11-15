@@ -1,0 +1,303 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- helpers ----
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+
+    // .get(default) is used instead of direct field access so a missing field
+    // makes the check false rather than raising an error.
+    //
+    // active() also requires a verified email. This is defence in depth: the
+    // app router blocks unverified users, and the rules block them too.
+    function active() {
+      return signedIn()
+        && request.auth.token.get('email_verified', false) == true
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && me().get('status', '') == 'active';
+    }
+    function isAdmin() { return active() && me().get('role', '') == 'admin'; }
+    function isStaff() { return active() && me().get('role', '') == 'staff'; }
+
+    function assignedLabs() { return me().get('assignedLabIds', []); }
+
+    // Device control is scoped: admins may control any lab; staff need both
+    // the explicit grant AND the lab in their assignedLabIds.
+    function canControlLab(labId) {
+      return isAdmin()
+        || (isStaff()
+            && me().get('canControlDevices', false) == true
+            && labId in assignedLabs());
+    }
+
+    function untouched(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+    function changed(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+    function createdAtIsRequestTime() {
+      return request.resource.data.get('createdAt', request.time) == request.time;
+    }
+
+    function validRoleStatus() {
+      return request.resource.data.get('role', '') in ['admin', 'instructor', 'staff']
+        && request.resource.data.get('status', '') in ['active', 'disabled', 'pending'];
+    }
+    function validLabAssignments() {
+      return request.resource.data.get('assignedLabIds', []) is list
+        && request.resource.data.get('assignedLabIds', []).size() <= 100;
+    }
+
+    // Public self-registration may only create its own pending Instructor
+    // profile. Admin creation is handled separately below.
+    function validSelfSignup() {
+      return request.resource.data.keys().hasAll(
+          ['displayName', 'email', 'phone', 'role', 'status',
+           'canControlDevices', 'createdAt'])
+        && request.resource.data.keys().hasOnly(
+          ['displayName', 'email', 'phone', 'role', 'status',
+           'canControlDevices', 'assignedLabIds', 'createdAt', 'updatedAt'])
+        && request.resource.data.get('email', '') == request.auth.token.get('email', '')
+        && request.resource.data.get('role', '') == 'instructor'
+        && request.resource.data.get('status', '') == 'pending'
+        && request.resource.data.get('canControlDevices', false) == false
+        && request.resource.data.get('assignedLabIds', []) is list
+        && request.resource.data.get('assignedLabIds', []).size() == 0
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 100
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 32
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.get('updatedAt', request.time) == request.time;
+    }
+
+    // ---- users: only admins change role/status/permissions ----
+    match /users/{uid} {
+      // Self-read is allowed while signed in even for pending/disabled and
+      // unverified accounts, so the app can show the right holding screen.
+      // Reading anyone else requires an active admin.
+      allow read: if (signedIn() && request.auth.uid == uid) || isAdmin();
+
+      allow create: if (isAdmin()
+            && validRoleStatus()
+            && validLabAssignments()
+            && request.resource.data.get('canControlDevices', false) is bool)
+        || (signedIn()
+            && request.auth.uid == uid
+            && validSelfSignup());
+
+      // Users may edit only a small allowlist of cosmetic fields. Admins can
+      // edit anyone, but may not change their own role/status (lockout guard).
+      allow update: if (isAdmin()
+            && (request.auth.uid != uid || untouched(['role', 'status']))
+            && (!changed(['role', 'status']) || validRoleStatus())
+            && (!changed(['assignedLabIds']) || validLabAssignments())
+            && (!changed(['canControlDevices'])
+                || request.resource.data.get('canControlDevices', false) is bool))
+        || (active()
+            && request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['displayName', 'photoUrl', 'phone', 'updatedAt'])
+            && request.resource.data.get('displayName', '').size() >= 2
+            && request.resource.data.get('displayName', '').size() <= 100
+            && request.resource.data.get('phone', '').size() <= 32
+            && request.resource.data.get('photoUrl', '').size() <= 2048
+            && request.resource.data.get('updatedAt', request.time) == request.time);
+
+      // Prefer disabling (status = 'disabled') over deleting; never delete
+      // your own account, so a sole admin cannot lock the project out.
+      allow delete: if isAdmin() && request.auth.uid != uid;
+
+      // Local in-app notification read markers. Owned by the signed-in user.
+      match /notificationReads/{key} {
+        allow read, create, update, delete: if active() && request.auth.uid == uid;
+      }
+    }
+
+    // ---- labs and telemetry ----
+    // Visibility of lab metadata and telemetry is intentionally global for
+    // active users; only device control is scoped to assignedLabIds above.
+    match /labs/{labId} {
+      allow read: if active();
+      // Admins manage metadata. `gatewayOnline` is a backend/gateway flag and
+      // is intentionally not writable by the Flutter client.
+      allow create, update: if isAdmin()
+        && (!('gatewayOnline' in request.resource.data)
+            || request.resource.data.gatewayOnline == resource.data.get('gatewayOnline', false));
+      allow delete: if isAdmin();
+
+      // Written ONLY by the IoT gateway / Cloud Function using the Admin SDK
+      // (which bypasses rules). No client may write sensor readings.
+      match /telemetry/{doc} {
+        allow read: if active();
+        allow write: if false;
+      }
+
+      // Control commands: queued by authorised users, executed and
+      // confirmed server-side. Clients cannot mark a command as succeeded.
+      match /commands/{cmdId} {
+        allow read: if canControlLab(labId);
+        allow create: if canControlLab(labId)
+          && exists(/databases/$(database)/documents/labs/$(labId))
+          && request.resource.data.requestedBy == request.auth.uid
+          && request.resource.data.status == 'pending'
+          && request.resource.data.device in ['light', 'ac']
+          && request.resource.data.action in ['on', 'off']
+          && request.resource.data.keys().hasOnly(
+               ['device', 'action', 'requestedBy', 'status', 'createdAt'])
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+    // ---- alerts ----
+    // Active users can create alerts (energy monitor, equipment reports,
+    // inspection issues). Acknowledge/resolve is limited to admin/staff.
+    match /alerts/{id} {
+      allow read: if active();
+      allow create: if active()
+        && request.resource.data.keys().hasOnly([
+             'category', 'severity', 'title', 'message', 'labId', 'status',
+             'sourceKey', 'createdBy', 'createdAt'
+           ])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.category in ['energy', 'lab', 'equipment', 'reservation', 'account', 'system']
+        && request.resource.data.severity in ['info', 'warning', 'critical']
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.message is string
+        && request.resource.data.message.size() <= 500
+        && request.resource.data.get('labId', '') is string
+        && request.resource.data.get('labId', '').size() <= 128
+        && request.resource.data.get('sourceKey', '') is string
+        && request.resource.data.get('sourceKey', '').size() <= 120
+        && createdAtIsRequestTime();
+      allow update: if (isAdmin() || isStaff())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+             'status', 'acknowledgedBy', 'acknowledgedAt',
+             'resolvedBy', 'resolvedAt', 'updatedAt'
+           ])
+        && request.resource.data.status in ['acknowledged', 'resolved'];
+      allow delete: if false;
+    }
+
+    // ---- reservations ----
+    // Read is global for active users so schedules are visible. Instructors
+    // create their own pending requests and may cancel them; admins/staff can
+    // approve, reject, cancel and complete.
+    match /reservations/{id} {
+      allow read: if active();
+      allow create: if active()
+        && request.resource.data.instructorId == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+             'labId', 'labName', 'title', 'purpose', 'instructorId',
+             'instructorName', 'startAt', 'endAt', 'status',
+             'createdAt', 'updatedAt', 'decidedBy', 'decisionNote'
+           ])
+        && request.resource.data.labId is string
+        && request.resource.data.labName is string
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 3
+        && request.resource.data.title.size() <= 100
+        && request.resource.data.get('purpose', '') is string
+        && request.resource.data.get('purpose', '').size() <= 500
+        && request.resource.data.startAt is timestamp
+        && request.resource.data.endAt is timestamp
+        && request.resource.data.endAt > request.resource.data.startAt
+        && (
+             request.resource.data.status == 'pending'
+          || ((isAdmin() || isStaff()) && request.resource.data.status == 'approved')
+        )
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+      allow update: if active() && (
+        // Owner may cancel their own booking.
+        (resource.data.instructorId == request.auth.uid
+          && request.resource.data.status == 'cancelled'
+          && resource.data.status in ['pending', 'approved']
+          && untouched(['labId', 'labName', 'title', 'purpose', 'instructorId',
+                        'instructorName', 'startAt', 'endAt', 'createdAt']))
+        // Admin/staff manage booking lifecycle.
+        || ((isAdmin() || isStaff())
+          && request.resource.data.status in ['approved', 'rejected', 'cancelled', 'completed']
+          && untouched(['labId', 'labName', 'title', 'purpose', 'instructorId',
+                        'instructorName', 'startAt', 'endAt', 'createdAt']))
+      );
+      allow delete: if false;
+    }
+
+    // ---- equipment ----
+    match /equipment/{id} {
+      allow read: if active();
+      allow create, update, delete: if isAdmin() || isStaff();
+    }
+
+    // ---- inspections ----
+    match /inspections/{id} {
+      allow read: if active();
+      allow create: if active()
+        && request.resource.data.inspectorId == request.auth.uid
+        && request.resource.data.type in ['before', 'after']
+        && request.resource.data.labId is string
+        && request.resource.data.items is list
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---- system configuration ----
+    match /config/{docId} {
+      allow read: if active();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ---- activity: append-only trail written by clients as themselves ----
+    // NOTE: extend the action list when a new module starts writing activity.
+    // Anything requiring tamper-proof auditing must be written server-side.
+    match /activity/{id} {
+      allow read: if isAdmin()
+        || (active() && resource.data.get('userId', '') == request.auth.uid);
+
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(
+             ['userId', 'action', 'labId', 'details', 'timestamp'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.timestamp == request.time
+        && request.resource.data.action in [
+             'login', 'logout', 'profile_updated',
+             'user_approved', 'user_rejected', 'user_updated',
+             'command_queued',
+             'reservation_created', 'reservation_approved',
+             'reservation_rejected', 'reservation_cancelled',
+             'reservation_completed',
+             'equipment_created', 'equipment_updated',
+             'equipment_deleted', 'equipment_reported',
+             'inspection_completed',
+             'alert_created', 'alert_acknowledged', 'alert_resolved',
+             'lab_created', 'lab_updated',
+             'settings_updated',
+             'report_exported'
+           ]
+        // Only administrators may claim an administrator audit action, so a
+        // normal user cannot write a misleading approval entry.
+        && (!(request.resource.data.action in
+               ['user_approved', 'user_rejected', 'user_updated'])
+            || isAdmin())
+        && request.resource.data.get('labId', '') is string
+        && request.resource.data.get('labId', '').size() <= 128
+        && request.resource.data.get('details', '') is string
+        && request.resource.data.get('details', '').size() <= 500;
+
+      allow update, delete: if false;
+    }
+
+    // Everything else is denied by default.
+    // Rules are OR'd: this cannot revoke an allow declared above.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

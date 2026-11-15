@@ -1,0 +1,16 @@
+{
+  "name": "labwatch-scripts",
+  "private": true,
+  "version": "0.1.0",
+  "description": "One-off administrative scripts for the LabWatch Firebase project.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "seed": "node seed-demo-accounts.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  }
+}

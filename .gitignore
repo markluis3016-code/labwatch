@@ -43,3 +43,19 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Firebase service accounts and CLI logs — never commit these.
+service-account*.json
+*service-account*.json
+*-firebase-adminsdk-*.json
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.firebase/
+
+# Optional local environment files
+.env
+.env.*
+
+# Node-based maintenance scripts
+scripts/node_modules/
